@@ -6,6 +6,9 @@ import tempfile
 
 TMP = tempfile.mkdtemp()
 os.environ["BUDGET_DB"] = os.path.join(TMP, "t.db")
+# never let a developer .env point the tests at a real cloud database or turn on the password gate
+os.environ["TURSO_DATABASE_URL"] = ""
+os.environ["APP_PASSWORD"] = ""
 import main  # noqa: E402
 import tursodb  # noqa: E402
 
