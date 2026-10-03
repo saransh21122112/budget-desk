@@ -230,13 +230,21 @@ def authenticate(username: str, password: str):
     return r[0] if r and ok else None
 
 
+def _weak_password(password: str, username: str):
+    if len(password) < 10:
+        return "Password must be at least 10 characters."
+    if username and username.lower() in password.lower():
+        return "Password must not contain the username."
+    return None
+
+
 def create_user(username: str, password: str):
     """Error text, or None when the account was created (with its own empty budget)."""
     u = username.strip().lower()
     if not re.match(USERNAME_RE, u):
         return "Username must be 3-30 characters: letters, digits, dot, dash or underscore."
-    if len(password) < 8:
-        return "Password must be at least 8 characters."
+    if err := _weak_password(password, u):
+        return err
     with db() as c:
         if u == ADMIN_USER or c.execute("select 1 from users where username=?", (u,)).fetchone():
             return "That username is already taken."
@@ -249,8 +257,9 @@ def create_user(username: str, password: str):
 def reset_password(uid: int, password: str):
     if uid == ADMIN_ID:
         return "The owner's password is APP_PASSWORD in Render."
-    if len(password) < 8:
-        return "Password must be at least 8 characters."
+    username = username_of(uid)
+    if err := _weak_password(password, username):
+        return err
     with db() as c:
         c.execute("update users set pw_hash=? where id=?", (hash_pw(password), uid))
     _USER_HASH.pop(uid, None)
@@ -778,7 +787,7 @@ SIGNUP_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <form class="card" method="post" action="/signup"><div class="logo">&#8377;</div><h1>Create your account</h1><p>Your budget is private: nobody else can see it.</p>
 <input name="code" placeholder="Invite code (from the owner)" autocomplete="off" autocapitalize="none" required>
 <input name="username" placeholder="Choose a username" autocomplete="username" autocapitalize="none" required>
-<input type="password" name="password" placeholder="Choose a password (8+ characters)" minlength="8" autocomplete="new-password" required>
+<input type="password" name="password" placeholder="Choose a password (10+ characters)" minlength="10" autocomplete="new-password" required>
 {error}<button>Create account</button><p class="alt"><a href="/login">I already have an account</a></p></form></body></html>""".replace("__CSS__", PAGE_CSS)
 
 
@@ -811,6 +820,14 @@ def _locked(ip, user=""):
     for k in keys:
         FAILS[k] = [t for t in FAILS.get(k, []) if now - t < 900]
     return any(len(FAILS[k]) >= 10 for k in keys)
+
+
+def _code_locked():
+    """30 wrong invite codes in 15 minutes pause SIGN-UP (never logins) for everyone, so the code cannot be brute-forced
+    even if a client address is faked."""
+    now = time.time()
+    FAILS["signup"] = [t for t in FAILS.get("signup", []) if now - t < 900]
+    return len(FAILS["signup"]) >= 30
 
 
 def _fail(ip, user=""):
@@ -921,10 +938,11 @@ async def signup(request: Request):
     if not APP_PASSWORD:
         return RedirectResponse("/", 303)
     ip, f = _ip(request), await _form(request)
-    if _locked(ip):
+    if _locked(ip) or _code_locked():
         return HTMLResponse(_signup_html("Too many attempts. Try again in 15 minutes."), 429)
-    if not invite_ok(f.get("code", "")):  # wrong or closed: counts toward the address lockout, like a bad password
+    if not invite_ok(f.get("code", "")):  # wrong or closed: counts toward the address and the sign-up lockouts
         _fail(ip)
+        FAILS.setdefault("signup", []).append(time.time())
         await asyncio.sleep(0.5)
     uid, err = try_signup(f.get("username", ""), f.get("password", ""), f.get("code", ""))
     if uid is None:
@@ -981,7 +999,7 @@ def admin_page(request: Request, m: str = "", e: str = ""):
     rows = "".join(
         f'<tr><td><b>{esc(u["username"])}</b><br><span class="muted">since {esc(u["created"] or "")}</span></td>'
         f'<td><form method="post" action="/admin/reset"><input type="hidden" name="id" value="{u["id"]}">'
-        f'<input type="password" name="password" placeholder="New password (8+)" minlength="8" required autocomplete="new-password"><button>Reset password</button></form></td>'
+        f'<input type="password" name="password" placeholder="New password (10+)" minlength="10" required autocomplete="new-password"><button>Reset password</button></form></td>'
         f'<td><form method="post" action="/admin/delete" onsubmit="return confirm(\'Delete {esc(u["username"])} and ALL their budget data? This cannot be undone.\')">'
         f'<input type="hidden" name="id" value="{u["id"]}"><button class="danger">Delete</button></form></td></tr>' for u in users)
     note = (f'<p class="ok">{esc(m)}</p>' if m else "") + (f'<p class="err">{esc(e)}</p>' if e else "")
@@ -999,7 +1017,7 @@ td{{padding:12px 6px;border-bottom:1px solid var(--line);vertical-align:top}} .m
 <body><div class="wrap"><p><a href="/">&larr; Back to my budget</a></p><div class="card"><h1>Family accounts</h1>
 <p>Each person gets their own private budget. Nobody can see anyone else's data, including yours. Share the username and password with them yourself.</p>{note}
 <form method="post" action="/admin/create"><input name="username" placeholder="New username (e.g. mom)" autocapitalize="none" required>
-<input type="password" name="password" placeholder="Password (8+ characters)" minlength="8" required autocomplete="new-password"><button style="margin-top:12px">Create account</button></form></div>
+<input type="password" name="password" placeholder="Password (10+ characters)" minlength="10" required autocomplete="new-password"><button style="margin-top:12px">Create account</button></form></div>
 <div class="card" style="margin-top:16px"><h1>Self sign-up</h1>{invite_panel}</div>
 <div class="card" style="margin-top:16px"><h1>Accounts ({len(users)})</h1>{'<table>' + rows + '</table>' if users else '<p>No accounts yet.</p>'}</div></div></body></html>""")
 

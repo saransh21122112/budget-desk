@@ -230,17 +230,17 @@ def test_lockouts_hit_the_attacker_not_the_family():
 def test_invite_code_signup():
     fresh()
     assert main.invite_code() == ""
-    assert main.try_signup("sis", "sis-secret-9", "x") == (None, "Sign-up is closed. Ask the owner for an account.")
+    assert main.try_signup("sis", "family-secret-9", "x") == (None, "Sign-up is closed. Ask the owner for an account.")
     main.set_invite(True)
     code = main.invite_code()
     assert len(code) == 10 and main.invite_ok(code.upper() + " ") and not main.invite_ok("wrong") and not main.invite_ok("")
-    assert main.try_signup("sis", "sis-secret-9", "wrong") == (None, "That invite code is not right.")
-    assert main.try_signup("sis", "short", code)[1] == "Password must be at least 8 characters."
+    assert main.try_signup("sis", "family-secret-9", "wrong") == (None, "That invite code is not right.")
+    assert main.try_signup("sis", "short", code)[1] == "Password must be at least 10 characters."
     real_pw, main.APP_PASSWORD = main.APP_PASSWORD, "owner-pass"
     try:
-        uid, err = main.try_signup("Sis", "sis-secret-9", code)
-        assert err is None and uid and main.authenticate("sis", "sis-secret-9") == uid
-        assert main.try_signup("sis", "sis-secret-9", code)[1] == "That username is already taken."
+        uid, err = main.try_signup("Sis", "family-secret-9", code)
+        assert err is None and uid and main.authenticate("sis", "family-secret-9") == uid
+        assert main.try_signup("sis", "family-secret-9", code)[1] == "That username is already taken."
         assert main.load(uid)["expenses"] == []  # a fresh private budget
         main.set_invite(True)  # a new code makes the old one useless
         assert main.invite_code() != code and not main.invite_ok(code)
@@ -248,10 +248,29 @@ def test_invite_code_signup():
         assert main.invite_code() == "" and not main.invite_ok(main.invite_code())
         main.set_invite(True)
         real_max, main.MAX_USERS = main.MAX_USERS, 2  # owner + sis already fill it
-        assert main.try_signup("bro", "bro-secret-9", main.invite_code()) == (None, "This site has reached its account limit.")
+        assert main.try_signup("bro", "tiffin-box-1234", main.invite_code()) == (None, "This site has reached its account limit.")
         main.MAX_USERS = real_max
     finally:
         main.APP_PASSWORD = real_pw
+
+
+def test_password_rules_and_invite_code_limit():
+    fresh()
+    assert main.create_user("mom", "short") == "Password must be at least 10 characters."
+    assert main.create_user("mom", "xx-MOM-xx-1234") == "Password must not contain the username."
+    assert main.create_user("mom", "a-good-secret-1") is None
+    uid = main.authenticate("mom", "a-good-secret-1") if main.APP_PASSWORD else None
+    with main.db() as c:
+        uid = c.execute("select id from users where username='mom'").fetchone()[0]
+    assert main.reset_password(uid, "mom-1234567") == "Password must not contain the username."
+    assert main.reset_password(uid, "another-secret-2") is None
+    main.FAILS.clear()
+    for _ in range(29):
+        main.FAILS.setdefault("signup", []).append(time.time())
+    assert not main._code_locked()
+    main.FAILS["signup"].append(time.time())
+    assert main._code_locked() and not main._locked("1.2.3.4", "mom")  # sign-up pauses; logins are unaffected
+    main.FAILS.clear()
 
 
 def test_forecast():
@@ -336,17 +355,17 @@ def test_interrupted_migration_resumes():
 
 def test_users_have_private_budgets():
     fresh()
-    assert main.create_user("mom", "mompass123") is None
+    assert main.create_user("mom", "kitchen-table-77") is None
     assert main.create_user("Mom", "another-pass") == "That username is already taken."
-    assert "at least 8" in (main.create_user("dad", "short") or "")
+    assert "at least 10" in (main.create_user("dad", "short") or "")
     assert "3-30" in (main.create_user("A!", "longenough1") or "")
     real_pw, main.APP_PASSWORD = main.APP_PASSWORD, "owner-pass"
     try:
         assert main.authenticate("admin", "owner-pass") == 1 and main.authenticate(" ADMIN ", "owner-pass") == 1
         assert main.authenticate("admin", "wrong") is None and main.authenticate("ghost", "x") is None
-        uid = main.authenticate("mom", "mompass123")
+        uid = main.authenticate("mom", "kitchen-table-77")
         assert uid and uid != 1 and main.authenticate("mom", "nope") is None
-        assert main.authenticate("admin", "mompass123") is None and main.authenticate("mom", "owner-pass") is None
+        assert main.authenticate("admin", "kitchen-table-77") is None and main.authenticate("mom", "owner-pass") is None
         # separate data, even with colliding ids
         mom = main.load(uid)
         assert mom["expenses"] == [] and mom["debts"] == []
@@ -373,14 +392,14 @@ def test_users_have_private_budgets():
         assert main._session_uid(stub("1." + good.split(".", 1)[1])) is None  # cannot swap in the owner's id
         assert main._session_uid(stub("")) is None and main._session_uid(stub("a.b.c")) is None
         # a password reset ends the old session; the new password works
-        assert main.reset_password(uid, "newpass123") is None
+        assert main.reset_password(uid, "morning-chai-88") is None
         assert main._session_uid(req) is None
-        assert main.authenticate("mom", "mompass123") is None and main.authenticate("mom", "newpass123") == uid
+        assert main.authenticate("mom", "kitchen-table-77") is None and main.authenticate("mom", "morning-chai-88") == uid
         assert "APP_PASSWORD" in (main.reset_password(1, "whatever123") or "")
         # deleting removes the person and every row of theirs
         token = main._session_token(uid, int(time.time()) + 100)
         main.delete_user(uid)
-        assert main._session_uid(stub(token)) is None and main.authenticate("mom", "newpass123") is None
+        assert main._session_uid(stub(token)) is None and main.authenticate("mom", "morning-chai-88") is None
         with main.db() as c:
             assert all(c.execute(f"select count(*) from {t} where user_id=?", (uid,)).fetchone()[0] == 0 for t, _ in main.TABLES)
         assert len(main.load()["expenses"]) == 9  # the owner is untouched
