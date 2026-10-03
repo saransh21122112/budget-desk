@@ -384,7 +384,7 @@ body.pre #thisMonth,body.pre #plan,body.pre #debts,body.pre #report,body.pre #fo
     <div id="affOut"></div>
   </section>
 
-  <p class="foot">Budget Desk is a planning aid, not a licensed financial advisor. · <a href="/logout" style="color:inherit">Log out</a></p>
+  <p class="foot" id="foot">Budget Desk is a planning aid, not a licensed financial advisor.</p>
 </main>
 
 <aside class="card chat" id="chat" aria-label="Budget assistant">
@@ -827,6 +827,7 @@ $('#input').addEventListener('input',e=>{e.target.style.height='auto';e.target.s
   renderChat();
   try{B=await (await fetch('/api/budget')).json();setStatus('Saved');redraw()}
   catch{setStatus('Cannot reach server','err')}
+  fetch('/api/me').then(r=>r.json()).then(u=>{if(u.auth)$('#foot').innerHTML+=` · Signed in as <b>${esc(u.username)}</b> · ${u.admin?'<a href="/admin" style="color:inherit">Family accounts</a> · ':''}<a href="/logout" style="color:inherit">Log out</a>`}).catch(()=>{});
 })();
 </script>
 </body>

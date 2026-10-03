@@ -35,7 +35,7 @@ Render's free plan has no persistent disk, so the data lives in a free [Turso](h
 1. Create a Turso database (any name) and a database token. Note its `libsql://...` URL.
 2. Push this folder to a **private** GitHub repo. In Render: New > Blueprint > pick the repo (`render.yaml` is read).
 3. Type `APP_PASSWORD` (long), `OPENAI_API_KEY`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` when asked.
-4. Open the Render URL; the browser asks for the password (any username).
+4. Open the Render URL and sign in as the owner (`ADMIN_USER` from `render.yaml`, password `APP_PASSWORD`). Create one account per family member at `/admin` (link at the bottom of the app); each person has a private budget nobody else can see, and a daily assistant limit (`CHAT_DAILY_LIMIT`, owner unlimited).
 The server refuses to start online without `APP_PASSWORD`. The free service sleeps after ~15 minutes idle (first request ~1 minute); your data is safe in Turso. The cloud starts with sample data; copy yours across once with
 `curl -s localhost:8000/api/budget > b.json` then `curl -u me:PASSWORD -X PUT https://YOUR-APP.onrender.com/api/budget -H 'content-type: application/json' --data @b.json`.
 Afterwards use one copy only (local and cloud do not sync). `APP_TZ` (default Asia/Kolkata) decides which month "today" is.

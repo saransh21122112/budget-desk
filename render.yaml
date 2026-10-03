@@ -11,7 +11,11 @@ services:
         value: "8080"
       - key: APP_TZ
         value: Asia/Kolkata
-      - key: APP_PASSWORD     # you type these four in the Render dashboard
+      - key: ADMIN_USER       # the owner's username; the family get their own accounts from /admin
+        value: saransh
+      - key: CHAT_DAILY_LIMIT
+        value: "40"
+      - key: APP_PASSWORD     # the owner's password. You type these four in the Render dashboard
         sync: false
       - key: OPENAI_API_KEY
         sync: false

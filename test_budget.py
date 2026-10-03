@@ -1,27 +1,31 @@
 """Run: python test_budget.py  (uses throwaway DBs, never your real one)"""
 import copy
+import itertools
 import os
 import sqlite3
 import tempfile
+import time
+from types import SimpleNamespace
+from typing import Any
 
 TMP = tempfile.mkdtemp()
 os.environ["BUDGET_DB"] = os.path.join(TMP, "t.db")
 # never let a developer .env point the tests at a real cloud database or turn on the password gate
 os.environ["TURSO_DATABASE_URL"] = ""
 os.environ["APP_PASSWORD"] = ""
+os.environ["ADMIN_USER"] = "admin"
 import main  # noqa: E402
 import tursodb  # noqa: E402
 
 T = main.cur()
 
 
+_db_ids = itertools.count()
+
+
 def fresh():
-    main.DB = os.path.join(TMP, f"t{fresh.n}.db")
-    fresh.n += 1
+    main.DB = os.path.join(TMP, f"t{next(_db_ids)}.db")
     main.init()
-
-
-fresh.n = 0
 
 
 def debt(i, person, direction, amount, rate=0, monthly=0):
@@ -159,12 +163,15 @@ def _fake_hrana():
                 return (not ok(c["cond"])) if c["type"] == "not" else errs[c["step"]] is None and res[c["step"]] is not None
             for st in r["batch"]["steps"]:
                 if st.get("condition") and not ok(st["condition"]):
-                    res.append(None), errs.append(None)
+                    res.append(None)
+                    errs.append(None)
                     continue
                 try:
-                    res.append(run(st["stmt"])), errs.append(None)
+                    res.append(run(st["stmt"]))
+                    errs.append(None)
                 except sqlite3.Error as e:
-                    res.append(None), errs.append({"message": str(e)})
+                    res.append(None)
+                    errs.append({"message": str(e)})
             out.append({"type": "batch", "result": {"step_results": res, "step_errors": errs}})
         return out
     return post
@@ -227,30 +234,113 @@ def test_snapshot_and_roundtrip():
     assert main.snapshot(b, T)["month"]["SPENDABLE_AFTER_DEBT_PLAN"] == 12960  # skipping frees it
 
 
-def test_migration_from_v1():
-    path = os.path.join(TMP, "v1.db")
+def _v2_db(path):
     c = sqlite3.connect(path)
     c.executescript("""
-      create table settings(id integer primary key, salary real, ef real, sip real, ef_saved real, ef_months real,
-        ret real, hike real, infl real, debt_pct real, debt_strategy text);
-      insert into settings values(1,98500,30000,0,0,6,0,8,5,50,'avalanche');
-      create table expenses(id integer primary key, name text, amount real, type text);
-      insert into expenses values(1,'Rent',17000,'fixed'),(2,'Cigarettes',3000,'variable');
+      create table settings(id integer primary key check(id=1), ef_saved real, ef_months real, ret real, hike real,
+        infl real, debt_pct real, debt_strategy text);
+      insert into settings values(1,0,6,0,8,5,50,'avalanche');
+      create table months(month text primary key, salary real, ef real, sip real, extra_income real default 0,
+        skip_ef integer default 0, skip_sip integer default 0, skip_debt integer default 0, note text default '');
+      insert into months(month,salary,ef,sip) values('2026-11',98500,30000,0);
+      create table expenses(id integer primary key, name text, amount real, type text, priority text default 'essential',
+        recurring integer default 1, start text, until text);
+      insert into expenses(id,name,amount,type,priority,start) values(1,'Rent',17000,'fixed','essential','2026-11'),
+        (2,'Cigarettes',3000,'variable','optional','2026-11');
       create table debts(id integer primary key, person text, direction text, amount real, rate real, monthly real, due text, note text);
       insert into debts values(1,'papa','owe',194000,0,0,'2028-01-01','');
+      create table payments(id integer primary key, debt_id integer, person text, direction text, month text, amount real);
+      create table notes(id integer primary key, text text);
+      insert into notes values(1,'all buffer to papa');
     """)
+    c.commit()
+    c.close()
+
+
+def _check_owner_data(b):
+    assert b["settings"]["debt_pct"] == 50 and b["debts"][0]["amount"] == 194000 and b["notes"][0]["text"] == "all buffer to papa"
+    v = main.month_view(b, "2026-11")
+    assert (v["salary"], v["ef"], v["sip"], v["spending"]) == (98500, 30000, 0, 20000)
+
+
+def test_migration_from_v2_keeps_the_owner_data():
+    path = os.path.join(TMP, "v2.db")
+    _v2_db(path)
+    main.DB = path
+    main.init()
+    _check_owner_data(main.load())
+    assert any(f.startswith("v2.db.bak-v2-") for f in os.listdir(TMP))
+    main.init()  # idempotent
+    main.save(copy.deepcopy(main.load()))
+    _check_owner_data(main.load())
+
+
+def test_interrupted_migration_resumes():
+    path = os.path.join(TMP, "v2b.db")
+    _v2_db(path)
+    c = sqlite3.connect(path)
+    c.execute("alter table expenses rename to expenses_v2")  # crashed right after the first rename
     c.commit()
     c.close()
     main.DB = path
     main.init()
     b = main.load()
-    assert b["settings"]["debt_pct"] == 50 and b["debts"][0]["amount"] == 194000
-    v = main.month_view(b, T)
-    assert (v["salary"], v["ef"], v["sip"], v["spending"]) == (98500, 30000, 0, 20000)
-    assert {e["name"]: e["priority"] for e in b["expenses"]} == {"Rent": "essential", "Cigarettes": "optional"}
-    assert any(f.startswith("v1.db.bak-") for f in os.listdir(TMP))
-    main.init()  # idempotent on an already-migrated db
-    main.save(copy.deepcopy(main.load()))
+    _check_owner_data(b)
+    assert len(b["expenses"]) == 2
+
+
+def test_users_have_private_budgets():
+    fresh()
+    assert main.create_user("mom", "mompass123") is None
+    assert main.create_user("Mom", "another-pass") == "That username is already taken."
+    assert "at least 8" in (main.create_user("dad", "short") or "")
+    assert "3-30" in (main.create_user("A!", "longenough1") or "")
+    real_pw, main.APP_PASSWORD = main.APP_PASSWORD, "owner-pass"
+    try:
+        assert main.authenticate("admin", "owner-pass") == 1 and main.authenticate(" ADMIN ", "owner-pass") == 1
+        assert main.authenticate("admin", "wrong") is None and main.authenticate("ghost", "x") is None
+        uid = main.authenticate("mom", "mompass123")
+        assert uid and uid != 1 and main.authenticate("mom", "nope") is None
+        assert main.authenticate("admin", "mompass123") is None and main.authenticate("mom", "owner-pass") is None
+        # separate data, even with colliding ids
+        mom = main.load(uid)
+        assert mom["expenses"] == [] and mom["debts"] == []
+        mom["months"].append(row(T, salary=50000))
+        mom["expenses"].append(dict(id=1, name="Rent", amount=9000, type="fixed", priority="essential", recurring=True, start=T, until=None))
+        main.save(mom, uid)
+        owner = main.load()
+        assert len(owner["expenses"]) == 9 and main.month_view(owner, T)["spending"] == 43040
+        assert main.month_view(main.load(uid), T)["spending"] == 9000
+        # assistant tools only touch the caller's own rows
+        ch: list[str] = []
+        main.run_tool("add_expense", {"name": "Tea", "amount": 50}, ch, T, uid)
+        assert len(main.load(uid)["expenses"]) == 2 and len(main.load()["expenses"]) == 9
+        assert main.run_tool("update_expense", {"id": 1, "amount": 1}, ch, T, uid) == "ok"
+        assert main.load()["expenses"][0]["amount"] == 17000 and main.load(uid)["expenses"][0]["amount"] == 1
+        # sessions
+        def stub(tok) -> Any:  # just enough of a Request for the cookie checks
+            return SimpleNamespace(cookies={"bd_session": tok})
+        req = stub(main._session_token(uid, int(time.time()) + 100))
+        assert main._session_uid(req) == uid
+        good = req.cookies["bd_session"]
+        assert main._session_uid(stub(good[:-1] + ("0" if good[-1] != "0" else "1"))) is None  # tampered
+        assert main._session_uid(stub(main._session_token(uid, int(time.time()) - 5))) is None  # expired
+        assert main._session_uid(stub("1." + good.split(".", 1)[1])) is None  # cannot swap in the owner's id
+        assert main._session_uid(stub("")) is None and main._session_uid(stub("a.b.c")) is None
+        # a password reset ends the old session; the new password works
+        assert main.reset_password(uid, "newpass123") is None
+        assert main._session_uid(req) is None
+        assert main.authenticate("mom", "mompass123") is None and main.authenticate("mom", "newpass123") == uid
+        assert "APP_PASSWORD" in (main.reset_password(1, "whatever123") or "")
+        # deleting removes the person and every row of theirs
+        token = main._session_token(uid, int(time.time()) + 100)
+        main.delete_user(uid)
+        assert main._session_uid(stub(token)) is None and main.authenticate("mom", "newpass123") is None
+        with main.db() as c:
+            assert all(c.execute(f"select count(*) from {t} where user_id=?", (uid,)).fetchone()[0] == 0 for t, _ in main.TABLES)
+        assert len(main.load()["expenses"]) == 9  # the owner is untouched
+    finally:
+        main.APP_PASSWORD = real_pw
 
 
 for name, fn in list(globals().items()):
