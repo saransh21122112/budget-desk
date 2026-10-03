@@ -1,0 +1,8 @@
+.venv
+.env
+*.db
+*.db.bak-*
+__pycache__
+test_budget.py
+README.md
+.git

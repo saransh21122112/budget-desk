@@ -1,0 +1,7 @@
+.env
+*.db
+*.db.bak-*
+*.db-journal
+.venv/
+__pycache__/
+.playwright-mcp/
