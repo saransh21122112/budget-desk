@@ -103,6 +103,7 @@ create table if not exists debts(user_id integer, id integer, person text, direc
 create table if not exists payments(user_id integer, id integer, debt_id integer, person text, direction text,
   month text, amount real, primary key(user_id, id));
 create table if not exists notes(user_id integer, id integer, text text, primary key(user_id, id));
+create table if not exists kv(k text primary key, v text);
 """
 TABLES = [("settings", SETTINGS), ("months", MONTH_COLS), ("expenses", EXP_COLS), ("debts", DEBT_COLS),
           ("payments", PAY_COLS), ("notes", ["id", "text"])]
@@ -254,6 +255,41 @@ def reset_password(uid: int, password: str):
         c.execute("update users set pw_hash=? where id=?", (hash_pw(password), uid))
     _USER_HASH.pop(uid, None)
     return None
+
+
+MAX_USERS = int(os.getenv("MAX_USERS", "25"))  # cap on accounts, so a leaked invite code cannot create thousands
+
+
+def invite_code() -> str:
+    """The current sign-up code, or "" when self sign-up is turned off. The owner manages it at /admin."""
+    with db() as c:
+        r = c.execute("select v from kv where k='invite'").fetchone()
+    return (r[0] or "") if r else ""
+
+
+def set_invite(on: bool):
+    with db() as c:
+        c.execute("insert into kv(k,v) values('invite',?) on conflict(k) do update set v=excluded.v",
+                  (secrets.token_hex(5) if on else "",))
+
+
+def invite_ok(code: str) -> bool:
+    inv = invite_code()
+    return bool(inv) and secrets.compare_digest(code.strip().lower().encode(), inv.encode())
+
+
+def try_signup(username: str, password: str, code: str):
+    """(user id, None) for a new account made with the right invite code, else (None, error text)."""
+    if not invite_code():
+        return None, "Sign-up is closed. Ask the owner for an account."
+    if not invite_ok(code):
+        return None, "That invite code is not right."
+    with db() as c:
+        n = c.execute("select count(*) from users").fetchone()[0]
+    if n >= MAX_USERS:
+        return None, "This site has reached its account limit."
+    err = create_user(username, password)
+    return (None, err) if err else (authenticate(username, password), None)
 
 
 def delete_user(uid: int):
@@ -730,11 +766,29 @@ button.danger{background:var(--bad)}a{color:var(--accent)}
 
 LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Budget Desk</title>
-<style>__CSS__ body{display:grid;place-items:center}form{width:100%;max-width:340px}form button{width:100%;margin-top:14px}</style></head><body>
+<style>__CSS__ body{display:grid;place-items:center}form{width:100%;max-width:340px}form button{width:100%;margin-top:14px}.alt{margin:14px 0 0;text-align:center;font-size:.85rem}</style></head><body>
 <form class="card" method="post" action="/login"><div class="logo">&#8377;</div><h1>Budget Desk</h1><p>Sign in to your budget.</p>
 <input name="username" placeholder="Username" autocomplete="username" autocapitalize="none" autofocus required>
 <input type="password" name="password" placeholder="Password" autocomplete="current-password" required>
-{error}<button>Sign in</button></form></body></html>""".replace("__CSS__", PAGE_CSS)
+{error}<button>Sign in</button>{signup}</form></body></html>""".replace("__CSS__", PAGE_CSS)
+
+SIGNUP_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Create account · Budget Desk</title>
+<style>__CSS__ body{display:grid;place-items:center}form{width:100%;max-width:340px}form button{width:100%;margin-top:14px}.alt{margin:14px 0 0;text-align:center;font-size:.85rem}</style></head><body>
+<form class="card" method="post" action="/signup"><div class="logo">&#8377;</div><h1>Create your account</h1><p>Your budget is private: nobody else can see it.</p>
+<input name="code" placeholder="Invite code (from the owner)" autocomplete="off" autocapitalize="none" required>
+<input name="username" placeholder="Choose a username" autocomplete="username" autocapitalize="none" required>
+<input type="password" name="password" placeholder="Choose a password (8+ characters)" minlength="8" autocomplete="new-password" required>
+{error}<button>Create account</button><p class="alt"><a href="/login">I already have an account</a></p></form></body></html>""".replace("__CSS__", PAGE_CSS)
+
+
+def _login_html(error: str = ""):
+    link = '<p class="alt"><a href="/signup">Have an invite code? Create an account</a></p>' if invite_code() else ""
+    return LOGIN_HTML.replace("{error}", f'<p class="err">{error}</p>' if error else "").replace("{signup}", link)
+
+
+def _signup_html(error: str = ""):
+    return SIGNUP_HTML.replace("{error}", f'<p class="err">{html.escape(error)}</p>' if error else "")
 
 SESSION_DAYS = 30
 FAILS: dict[str, list[float]] = {}  # client ip -> recent failed-login times. ponytail: in memory, fine for one instance
@@ -747,16 +801,22 @@ def _ip(request: Request):
     return parts[-1] if parts else (request.client.host if request.client else "")
 
 
-def _locked(ip):
+def _locked(ip, user=""):
+    """10 failures in 15 minutes lock that client address, and that account. The owner's account is exempt (strong random
+    password), so nobody can lock the owner out. There is deliberately no global lock: it would let one attacker block the family."""
     now = time.time()
-    for k in (ip, ""):  # "" is the global bucket, so rotating source addresses cannot beat the limit
+    if len(FAILS) > 5000:  # bound memory against made-up usernames
+        FAILS.clear()
+    keys = [ip] + ([f"u:{user}"] if user and user != ADMIN_USER else [])
+    for k in keys:
         FAILS[k] = [t for t in FAILS.get(k, []) if now - t < 900]
-    return len(FAILS[ip]) >= 10 or len(FAILS[""]) >= 50  # per client / all clients, per 15 minutes
+    return any(len(FAILS[k]) >= 10 for k in keys)
 
 
-def _fail(ip):
-    FAILS.setdefault(ip, []).append(time.time())
-    FAILS.setdefault("", []).append(time.time())
+def _fail(ip, user=""):
+    for k in (ip, f"u:{user}" if user and user != ADMIN_USER else ""):
+        if k:
+            FAILS.setdefault(k, []).append(time.time())
 
 
 def _sig(uid: int, exp: int, pw_hash: str):
@@ -779,16 +839,16 @@ def _session_uid(request: Request):
     return None
 
 
-def _basic_uid(request: Request):
-    """For scripts: user id from HTTP Basic, False if given but wrong, None if absent."""
+def _basic_creds(request: Request):
+    """(username, password) from HTTP Basic, or None when the header is absent. For scripts."""
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("basic "):
         return None
     try:
         user, _, pw = base64.b64decode(auth[6:]).decode().partition(":")
     except ValueError:
-        return False
-    return authenticate(user, pw) or False
+        return ("", "")
+    return user.strip().lower()[:64], pw
 
 
 async def _form(request: Request):
@@ -801,18 +861,18 @@ async def require_login(request: Request, call_next):
     Sets request.state.uid, which scopes every data query to the signed-in person."""
     path = request.url.path
     request.state.uid = ADMIN_ID
-    if not APP_PASSWORD or path in ("/login", "/logout"):
+    if not APP_PASSWORD or path in ("/login", "/logout", "/signup"):
         return await call_next(request)
     uid = _session_uid(request)
     if uid is None:
-        ip, basic = _ip(request), _basic_uid(request)
-        if _locked(ip):
+        ip, creds = _ip(request), _basic_creds(request)
+        user = creds[0] if creds else ""
+        if _locked(ip, user):
             return Response("Too many failed attempts. Try again in 15 minutes.", 429)
-        if basic:
-            uid = basic
-        else:
-            if basic is False:  # wrong Basic credentials count as a failed attempt
-                _fail(ip)
+        uid = authenticate(*creds) if creds else None
+        if uid is None:
+            if creds:  # wrong Basic credentials count as a failed attempt
+                _fail(ip, user)
                 await asyncio.sleep(0.5)
             if path.startswith("/api/"):
                 return Response("Login required", 401)
@@ -821,28 +881,55 @@ async def require_login(request: Request, call_next):
     return await call_next(request)
 
 
+def _start_session(uid: int, request: Request):
+    r = RedirectResponse("/", 303)
+    r.set_cookie("bd_session", _session_token(uid, int(time.time()) + SESSION_DAYS * 86400), max_age=SESSION_DAYS * 86400,
+                 httponly=True, samesite="lax", secure=request.headers.get("x-forwarded-proto") == "https")
+    return r
+
+
 @app.get("/login")
 def login_page():
-    return HTMLResponse(LOGIN_HTML.replace("{error}", "")) if APP_PASSWORD else RedirectResponse("/", 303)
+    return HTMLResponse(_login_html()) if APP_PASSWORD else RedirectResponse("/", 303)
 
 
 @app.post("/login")
 async def login(request: Request):
     if not APP_PASSWORD:
         return RedirectResponse("/", 303)
-    ip = _ip(request)
-    if _locked(ip):
-        return HTMLResponse(LOGIN_HTML.replace("{error}", '<p class="err">Too many attempts. Try again in 15 minutes.</p>'), 429)
-    f = await _form(request)
-    uid = authenticate(f.get("username", ""), f.get("password", ""))
+    ip, f = _ip(request), await _form(request)
+    user = f.get("username", "").strip().lower()[:64]
+    if _locked(ip, user):
+        return HTMLResponse(_login_html("Too many attempts. Try again in 15 minutes."), 429)
+    uid = authenticate(user, f.get("password", ""))
     if uid is not None:
-        r = RedirectResponse("/", 303)
-        r.set_cookie("bd_session", _session_token(uid, int(time.time()) + SESSION_DAYS * 86400), max_age=SESSION_DAYS * 86400,
-                     httponly=True, samesite="lax", secure=request.headers.get("x-forwarded-proto") == "https")
-        return r
-    _fail(ip)
+        return _start_session(uid, request)
+    _fail(ip, user)
     await asyncio.sleep(0.5)  # slows password guessing
-    return HTMLResponse(LOGIN_HTML.replace("{error}", '<p class="err">Wrong username or password</p>'), 401)
+    return HTMLResponse(_login_html("Wrong username or password"), 401)
+
+
+@app.get("/signup")
+def signup_page():
+    if not APP_PASSWORD:
+        return RedirectResponse("/", 303)
+    return HTMLResponse(_signup_html() if invite_code() else _signup_html("Sign-up is closed. Ask the owner for an account."))
+
+
+@app.post("/signup")
+async def signup(request: Request):
+    if not APP_PASSWORD:
+        return RedirectResponse("/", 303)
+    ip, f = _ip(request), await _form(request)
+    if _locked(ip):
+        return HTMLResponse(_signup_html("Too many attempts. Try again in 15 minutes."), 429)
+    if not invite_ok(f.get("code", "")):  # wrong or closed: counts toward the address lockout, like a bad password
+        _fail(ip)
+        await asyncio.sleep(0.5)
+    uid, err = try_signup(f.get("username", ""), f.get("password", ""), f.get("code", ""))
+    if uid is None:
+        return HTMLResponse(_signup_html(err or "Could not create the account."), 400)
+    return _start_session(uid, request)
 
 
 @app.get("/logout")
@@ -898,6 +985,14 @@ def admin_page(request: Request, m: str = "", e: str = ""):
         f'<td><form method="post" action="/admin/delete" onsubmit="return confirm(\'Delete {esc(u["username"])} and ALL their budget data? This cannot be undone.\')">'
         f'<input type="hidden" name="id" value="{u["id"]}"><button class="danger">Delete</button></form></td></tr>' for u in users)
     note = (f'<p class="ok">{esc(m)}</p>' if m else "") + (f'<p class="err">{esc(e)}</p>' if e else "")
+    inv = invite_code()
+    invite_panel = (
+        f'<p>Sign-up is <b>on</b>. Send your family this link and code:</p><p style="font-size:1.1rem;color:var(--ink)">'
+        f'<a href="{esc(str(request.base_url))}signup">{esc(str(request.base_url))}signup</a><br>Invite code: <b>{esc(inv)}</b></p>'
+        '<form method="post" action="/admin/invite" style="display:flex;gap:8px;flex-wrap:wrap"><button name="a" value="new">New code</button>'
+        '<button name="a" value="off" class="danger">Turn sign-up off</button></form>' if inv else
+        '<p>Sign-up is <b>off</b>. Turn it on to let family create their own account with an invite code.</p>'
+        '<form method="post" action="/admin/invite"><button name="a" value="on">Turn sign-up on</button></form>')
     return HTMLResponse(f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Accounts · Budget Desk</title><style>{PAGE_CSS} .wrap{{max-width:720px;margin:0 auto}} table{{width:100%;border-collapse:collapse}}
 td{{padding:12px 6px;border-bottom:1px solid var(--line);vertical-align:top}} .muted{{color:var(--muted);font-size:.8rem}} td form{{margin:0}} td input{{margin:0 0 8px}}</style></head>
@@ -905,7 +1000,16 @@ td{{padding:12px 6px;border-bottom:1px solid var(--line);vertical-align:top}} .m
 <p>Each person gets their own private budget. Nobody can see anyone else's data, including yours. Share the username and password with them yourself.</p>{note}
 <form method="post" action="/admin/create"><input name="username" placeholder="New username (e.g. mom)" autocapitalize="none" required>
 <input type="password" name="password" placeholder="Password (8+ characters)" minlength="8" required autocomplete="new-password"><button style="margin-top:12px">Create account</button></form></div>
+<div class="card" style="margin-top:16px"><h1>Self sign-up</h1>{invite_panel}</div>
 <div class="card" style="margin-top:16px"><h1>Accounts ({len(users)})</h1>{'<table>' + rows + '</table>' if users else '<p>No accounts yet.</p>'}</div></div></body></html>""")
+
+
+@app.post("/admin/invite")
+async def admin_invite(request: Request):
+    _admin_only(request)
+    a = (await _form(request)).get("a", "")
+    set_invite(a in ("on", "new"))
+    return RedirectResponse("/admin?m=" + quote({"on": "Sign-up is on.", "new": "New invite code made. The old one no longer works."}.get(a, "Sign-up is off.")), 303)
 
 
 @app.post("/admin/create")

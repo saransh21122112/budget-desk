@@ -12,7 +12,7 @@ services:
       - key: APP_TZ
         value: Asia/Kolkata
       - key: ADMIN_USER       # the owner's username; the family get their own accounts from /admin
-        value: saransh
+        value: admin
       - key: CHAT_DAILY_LIMIT
         value: "40"
       - key: APP_PASSWORD     # the owner's password. You type these four in the Render dashboard

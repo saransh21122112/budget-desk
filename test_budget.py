@@ -209,6 +209,51 @@ def test_turso_client_runs_the_app():
         tursodb.Remote._post, main.TURSO_URL = real_post, real_url
 
 
+def test_lockouts_hit_the_attacker_not_the_family():
+    main.FAILS.clear()
+    for _ in range(10):
+        main._fail("1.1.1.1", "mom")
+    assert main._locked("1.1.1.1", "dad")  # the attacker's address is locked
+    assert main._locked("9.9.9.9", "mom")  # and so is the targeted account, from any address
+    assert not main._locked("9.9.9.9", "dad") and not main._locked("9.9.9.9", main.ADMIN_USER)
+    main.FAILS.clear()
+    for i in range(200):  # a spread-out attack on many accounts never produces a global lock
+        main._fail(f"2.2.{i}.1", f"user{i}")
+    assert not main._locked("3.3.3.3", "mom") and not main._locked("3.3.3.3", main.ADMIN_USER)
+    main.FAILS.clear()
+    for _ in range(50):  # nobody can lock the owner out by guessing the owner's password
+        main._fail("4.4.4.4", main.ADMIN_USER)
+    assert not main._locked("5.5.5.5", main.ADMIN_USER) and main._locked("4.4.4.4", main.ADMIN_USER)
+    main.FAILS.clear()
+
+
+def test_invite_code_signup():
+    fresh()
+    assert main.invite_code() == ""
+    assert main.try_signup("sis", "sis-secret-9", "x") == (None, "Sign-up is closed. Ask the owner for an account.")
+    main.set_invite(True)
+    code = main.invite_code()
+    assert len(code) == 10 and main.invite_ok(code.upper() + " ") and not main.invite_ok("wrong") and not main.invite_ok("")
+    assert main.try_signup("sis", "sis-secret-9", "wrong") == (None, "That invite code is not right.")
+    assert main.try_signup("sis", "short", code)[1] == "Password must be at least 8 characters."
+    real_pw, main.APP_PASSWORD = main.APP_PASSWORD, "owner-pass"
+    try:
+        uid, err = main.try_signup("Sis", "sis-secret-9", code)
+        assert err is None and uid and main.authenticate("sis", "sis-secret-9") == uid
+        assert main.try_signup("sis", "sis-secret-9", code)[1] == "That username is already taken."
+        assert main.load(uid)["expenses"] == []  # a fresh private budget
+        main.set_invite(True)  # a new code makes the old one useless
+        assert main.invite_code() != code and not main.invite_ok(code)
+        main.set_invite(False)
+        assert main.invite_code() == "" and not main.invite_ok(main.invite_code())
+        main.set_invite(True)
+        real_max, main.MAX_USERS = main.MAX_USERS, 2  # owner + sis already fill it
+        assert main.try_signup("bro", "bro-secret-9", main.invite_code()) == (None, "This site has reached its account limit.")
+        main.MAX_USERS = real_max
+    finally:
+        main.APP_PASSWORD = real_pw
+
+
 def test_forecast():
     fresh()
     b = main.load()
