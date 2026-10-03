@@ -1,23 +1,21 @@
-# Render Blueprint: New > Blueprint > pick this repo. SQLite lives on the disk, so keep it to one instance.
+# Render Blueprint (free plan). Free servers have no persistent disk, so the data lives in a free Turso database.
 services:
   - type: web
     name: budget-desk
     runtime: docker
-    plan: starter        # persistent disks are not available on the free plan
+    plan: free           # sleeps after ~15 min idle; the first request then takes about a minute
     region: singapore    # closest to India
     autoDeploy: true
     envVars:
       - key: PORT
         value: "8080"
-      - key: BUDGET_DB
-        value: /data/budget.db
       - key: APP_TZ
         value: Asia/Kolkata
-      - key: APP_PASSWORD   # you type these two in the Render dashboard
+      - key: APP_PASSWORD     # you type these four in the Render dashboard
         sync: false
       - key: OPENAI_API_KEY
         sync: false
-    disk:
-      name: budget-data
-      mountPath: /data
-      sizeGB: 1
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false

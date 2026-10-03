@@ -7,6 +7,7 @@ import tempfile
 TMP = tempfile.mkdtemp()
 os.environ["BUDGET_DB"] = os.path.join(TMP, "t.db")
 import main  # noqa: E402
+import tursodb  # noqa: E402
 
 T = main.cur()
 
@@ -127,6 +128,75 @@ def test_tracking_starts_in_first_salary_month():
     sim = main.repay_sim(b)
     assert sim["sched"][0]["month"] == nxt and sim["months"] == 8
     assert main.planned_debt(b, T, sim) == 0 and main.planned_debt(b, nxt, sim) == 12960
+
+
+def _fake_hrana():
+    """Stand-in for Turso's HTTP API, backed by in-memory sqlite, so app code runs through the real client."""
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    enc = lambda v: ({"type": "null"} if v is None else {"type": "integer", "value": str(v)} if isinstance(v, int)
+                     else {"type": "float", "value": v} if isinstance(v, float) else {"type": "text", "value": v})
+    dec = lambda v: None if v["type"] == "null" else int(v["value"]) if v["type"] == "integer" else v["value"]
+
+    def run(st):
+        params = ({a["name"].lstrip(":"): dec(a["value"]) for a in st["named_args"]} if "named_args" in st
+                  else [dec(a) for a in st.get("args", [])])
+        cur = conn.execute(st["sql"], params)
+        return {"cols": [{"name": d[0]} for d in cur.description or []],
+                "rows": [[enc(v) for v in r] for r in cur.fetchall()], "affected_row_count": cur.rowcount}
+
+    def post(self, requests):
+        out = []
+        for r in requests:
+            if r["type"] == "execute":
+                out.append({"type": "execute", "result": run(r["stmt"])})
+                continue
+            res, errs = [], []
+
+            def ok(c):
+                return (not ok(c["cond"])) if c["type"] == "not" else errs[c["step"]] is None and res[c["step"]] is not None
+            for st in r["batch"]["steps"]:
+                if st.get("condition") and not ok(st["condition"]):
+                    res.append(None), errs.append(None)
+                    continue
+                try:
+                    res.append(run(st["stmt"])), errs.append(None)
+                except sqlite3.Error as e:
+                    res.append(None), errs.append({"message": str(e)})
+            out.append({"type": "batch", "result": {"step_results": res, "step_errors": errs}})
+        return out
+    return post
+
+
+def test_turso_client_runs_the_app():
+    real_post, real_url = tursodb.Remote._post, main.TURSO_URL
+    tursodb.Remote._post, main.TURSO_URL = _fake_hrana(), "libsql://fake.example"
+    try:
+        main.init()
+        b = main.load()
+        v = main.month_view(b, T)
+        assert (v["spending"], v["buffer"]) == (43040, 12960)
+        b["debts"] = [debt(None, "papa", "owe", 194000)]
+        b["notes"] = [dict(id=None, text="rule")]
+        main.save(b)
+        assert main.load()["debts"][0]["person"] == "papa" and main.load()["notes"][0]["text"] == "rule"
+        bad = main.load()  # a duplicate id makes one insert fail: nothing may change
+        bad["expenses"].append(dict(bad["expenses"][0]))
+        try:
+            main.save(bad)
+            raise AssertionError("expected the save to fail")
+        except RuntimeError:
+            pass
+        after = main.load()
+        assert len(after["expenses"]) == 9 and after["debts"][0]["person"] == "papa"
+        ch = []
+        rent = next(e for e in after["expenses"] if e["name"] == "Rent")
+        assert main.run_tool("update_expense", {"id": rent["id"], "amount": 20000}, ch, main.addm(T, 2)) == "ok"
+        assert main.run_tool("record_payment", {"id": after["debts"][0]["id"], "amount": 4000}, ch, T) == "ok"
+        end = main.load()
+        assert main.month_view(end, T)["spending"] == 43040 and main.month_view(end, main.addm(T, 2))["spending"] == 46040
+        assert end["debts"][0]["amount"] == 190000 and end["payments"][0]["amount"] == 4000
+    finally:
+        tursodb.Remote._post, main.TURSO_URL = real_post, real_url
 
 
 def test_forecast():

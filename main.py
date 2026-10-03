@@ -14,15 +14,18 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 import openai
+import tursodb
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 
 HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
 DB = os.getenv("BUDGET_DB", str(HERE / "budget.db"))
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+TURSO_URL = os.getenv("TURSO_DATABASE_URL", "")  # set on a host with no persistent disk; otherwise local SQLite file
 
 SETTINGS = ["ef_saved", "ef_months", "ret", "hike", "infl", "debt_pct", "debt_strategy"]
 SETTINGS_DEFAULTS = dict(ef_saved=0, ef_months=6, ret=12, hike=8, infl=5, debt_pct=100, debt_strategy="avalanche")
@@ -64,6 +67,9 @@ def diffm(a, b):
 # ---------- storage ----------
 @contextmanager
 def db():
+    if TURSO_URL:
+        yield tursodb.Remote(TURSO_URL, os.getenv("TURSO_AUTH_TOKEN", ""))
+        return
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     try:
@@ -129,13 +135,17 @@ def load():
 
 def save(b):
     ins = lambda t, cols: f"insert into {t}(" + ",".join(cols) + ") values(" + ",".join(":" + k for k in cols) + ")"
+    stmts = [("update settings set " + ",".join(f"{k}=?" for k in SETTINGS) + " where id=1", [b["settings"][k] for k in SETTINGS])]
+    for t, cols in [("months", MONTH_COLS), ("expenses", EXP_COLS), ("debts", DEBT_COLS),
+                    ("payments", PAY_COLS), ("notes", ["id", "text"])]:
+        stmts.append((f"delete from {t}", ()))
+        stmts += [(ins(t, cols), row) for row in b[t]]
     with db() as c:
-        c.execute("update settings set " + ",".join(f"{k}=?" for k in SETTINGS) + " where id=1",
-                  [b["settings"][k] for k in SETTINGS])
-        for t, cols in [("months", MONTH_COLS), ("expenses", EXP_COLS), ("debts", DEBT_COLS),
-                        ("payments", PAY_COLS), ("notes", ["id", "text"])]:
-            c.execute(f"delete from {t}")
-            c.executemany(ins(t, cols), b[t])
+        if hasattr(c, "atomic"):  # Turso: one transaction, so a failed save never leaves a half-empty budget
+            c.atomic(stmts)
+        else:
+            for sql, params in stmts:
+                c.execute(sql, params)
 
 
 # ---------- shared calculations (the frontend mirrors these in JS) ----------
@@ -575,6 +585,8 @@ if os.getenv("RENDER") and not APP_PASSWORD:  # Render sets RENDER=true; never r
     raise RuntimeError("APP_PASSWORD must be set on a deployed server")
 init()
 app = FastAPI(title="Budget Desk")
+if not APP_PASSWORD:  # local mode: refuse other Host headers so a website cannot reach the API via DNS rebinding
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
 
 @app.middleware("http")
@@ -611,6 +623,8 @@ def put_budget(b: Budget):
         save(b.model_dump())
     except sqlite3.IntegrityError as e:
         raise HTTPException(400, f"Duplicate id: {e}")
+    except RuntimeError as e:  # Turso reports constraint errors as RuntimeError
+        raise HTTPException(400, str(e))
     return load()
 
 

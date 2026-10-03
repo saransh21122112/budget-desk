@@ -30,10 +30,15 @@ Track money you owe and money you lent. Repayment uses each month's own free buf
 ## Assistant
 OpenAI chat with tool calling (`OPENAI_MODEL`, default `gpt-4o-mini`). It is given the viewed month's computed numbers (including what is free after the debt plan), your debts, recent months and your standing rules, and it can edit all of them. State a lasting intention ("all my buffer goes to papa") and it saves it as a rule. The key stays on the server.
 
-## Deploy (Render)
-`render.yaml` + `Dockerfile` are ready. Push this folder to a **private** GitHub repo, then in Render choose New > Blueprint, pick the repo, and type `APP_PASSWORD` and `OPENAI_API_KEY` when asked. The Starter plan with a 1 GB disk (about $7.25/month) is needed so the SQLite file survives restarts. The server refuses to start online without `APP_PASSWORD`; every page and API call then asks for it (any username, that password).
-
-The cloud copy starts with seed data. To bring your data across, use Render's shell (`Shell` tab) to upload or recreate it, and keep using one copy only (local and cloud do not sync). `APP_TZ` (default Asia/Kolkata) decides which month "today" is.
+## Deploy free (Render + Turso)
+Render's free plan has no persistent disk, so the data lives in a free [Turso](https://turso.tech) database instead of `budget.db`.
+1. Create a Turso database (any name) and a database token. Note its `libsql://...` URL.
+2. Push this folder to a **private** GitHub repo. In Render: New > Blueprint > pick the repo (`render.yaml` is read).
+3. Type `APP_PASSWORD` (long), `OPENAI_API_KEY`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` when asked.
+4. Open the Render URL; the browser asks for the password (any username).
+The server refuses to start online without `APP_PASSWORD`. The free service sleeps after ~15 minutes idle (first request ~1 minute); your data is safe in Turso. The cloud starts with sample data; copy yours across once with
+`curl -s localhost:8000/api/budget > b.json` then `curl -u me:PASSWORD -X PUT https://YOUR-APP.onrender.com/api/budget -H 'content-type: application/json' --data @b.json`.
+Afterwards use one copy only (local and cloud do not sync). `APP_TZ` (default Asia/Kolkata) decides which month "today" is.
 
 ## Test
-`python test_budget.py` uses throwaway databases: derived numbers, month semantics, history-preserving edits, repayment plan, skip cost, migration.
+`python test_budget.py` uses throwaway databases: derived numbers, month semantics, history-preserving edits, repayment plan, skip cost, migration, and the Turso client (rollback on a failed save).
