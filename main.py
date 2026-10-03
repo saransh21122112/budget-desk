@@ -805,9 +805,16 @@ CHAT_USED: dict[tuple[int, str], int] = {}  # (user id, date) -> assistant messa
 
 
 def _ip(request: Request):
-    """Rightmost X-Forwarded-For entry: added by Render's proxy, so a client cannot forge it (the left side is client-supplied)."""
+    """The client's address behind Render. Cloudflare sets CF-Connecting-IP itself, so a client cannot forge it. Otherwise use
+    X-Forwarded-For: Cloudflare appends the client, then Render's proxy appends its own address, so the client is the entry
+    before the last; everything further left is client-supplied. Running locally there is no proxy: use the connection address."""
+    cf = request.headers.get("cf-connecting-ip", "").strip()
+    if cf:
+        return cf
     parts = [p.strip() for p in request.headers.get("x-forwarded-for", "").split(",") if p.strip()]
-    return parts[-1] if parts else (request.client.host if request.client else "")
+    if len(parts) >= 2:
+        return parts[-2]
+    return parts[0] if parts else (request.client.host if request.client else "")
 
 
 def _locked(ip, user=""):
@@ -1004,6 +1011,9 @@ def admin_page(request: Request, m: str = "", e: str = ""):
         f'<input type="hidden" name="id" value="{u["id"]}"><button class="danger">Delete</button></form></td></tr>' for u in users)
     note = (f'<p class="ok">{esc(m)}</p>' if m else "") + (f'<p class="err">{esc(e)}</p>' if e else "")
     inv = invite_code()
+    seen = (f'<p class="muted" style="margin-top:12px">Your address as the server sees it: <b>{esc(_ip(request))}</b> '
+            f'(CF-Connecting-IP: {esc(request.headers.get("cf-connecting-ip", "-"))}; '
+            f'X-Forwarded-For: {esc(request.headers.get("x-forwarded-for", "-"))})</p>')
     invite_panel = (
         f'<p>Sign-up is <b>on</b>. Send your family this link and code:</p><p style="font-size:1.1rem;color:var(--ink)">'
         f'<a href="{esc(str(request.base_url))}signup">{esc(str(request.base_url))}signup</a><br>Invite code: <b>{esc(inv)}</b></p>'
@@ -1019,7 +1029,7 @@ td{{padding:12px 6px;border-bottom:1px solid var(--line);vertical-align:top}} .m
 <form method="post" action="/admin/create"><input name="username" placeholder="New username (e.g. mom)" autocapitalize="none" required>
 <input type="password" name="password" placeholder="Password (10+ characters)" minlength="10" required autocomplete="new-password"><button style="margin-top:12px">Create account</button></form></div>
 <div class="card" style="margin-top:16px"><h1>Self sign-up</h1>{invite_panel}</div>
-<div class="card" style="margin-top:16px"><h1>Accounts ({len(users)})</h1>{'<table>' + rows + '</table>' if users else '<p>No accounts yet.</p>'}</div></div></body></html>""")
+<div class="card" style="margin-top:16px"><h1>Accounts ({len(users)})</h1>{'<table>' + rows + '</table>' if users else '<p>No accounts yet.</p>'}</div>{seen}</div></body></html>""")
 
 
 @app.post("/admin/invite")

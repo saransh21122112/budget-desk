@@ -273,6 +273,16 @@ def test_password_rules_and_invite_code_limit():
     main.FAILS.clear()
 
 
+def test_client_address_behind_render():
+    def req(**headers) -> Any:
+        return SimpleNamespace(headers={k.replace("_", "-"): v for k, v in headers.items()}, client=SimpleNamespace(host="10.0.0.9"))
+    assert main._ip(req(cf_connecting_ip="203.0.113.7")) == "203.0.113.7"  # Cloudflare's own header wins
+    assert main._ip(req(x_forwarded_for="203.0.113.7, 172.70.1.1")) == "203.0.113.7"  # client, then Render's proxy
+    assert main._ip(req(x_forwarded_for="6.6.6.6, 203.0.113.7, 172.70.1.1")) == "203.0.113.7"  # a faked left entry is ignored
+    assert main._ip(req(x_forwarded_for="1.2.3.4")) == "1.2.3.4"  # a single entry (no proxy chain)
+    assert main._ip(req()) == "10.0.0.9"  # nothing but the connection
+
+
 def test_forecast():
     fresh()
     b = main.load()
