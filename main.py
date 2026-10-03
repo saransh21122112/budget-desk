@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -7,6 +9,7 @@ import shutil
 import sqlite3
 import secrets
 import time
+from urllib.parse import parse_qs
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +20,7 @@ import openai
 import tursodb
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 
@@ -591,22 +594,76 @@ if not APP_PASSWORD:  # local mode: refuse other Host headers so a website canno
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
 
+LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Budget Desk</title>
+<style>:root{color-scheme:light dark;--bg:#f3efe6;--card:#fffdf9;--ink:#1c1a2e;--muted:#6b6780;--line:#e7e0d1;--accent:#4f46e5;--bad:#b9302a}
+@media(prefers-color-scheme:dark){:root{--bg:#0e0f1f;--card:#171832;--ink:#ecebf7;--muted:#9b99b6;--line:#2b2d50;--accent:#8b85ff;--bad:#ff7a70}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,sans-serif}
+form{width:100%;max-width:340px;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:28px;box-shadow:0 12px 28px -16px rgba(40,30,10,.3)}
+.logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--accent),#7c74ff);color:#fff;display:grid;place-items:center;font:600 22px system-ui}
+h1{font-size:1.3rem;margin:14px 0 2px}p{margin:0 0 18px;color:var(--muted);font-size:.88rem}
+input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:transparent;color:inherit;font:inherit}
+input:focus{outline:2px solid var(--accent);outline-offset:1px}
+button{width:100%;margin-top:12px;padding:11px;border:0;border-radius:10px;background:var(--accent);color:#fff;font:600 1rem system-ui;cursor:pointer}
+.err{color:var(--bad);font-size:.85rem;margin:8px 0 0}</style></head><body>
+<form method="post" action="/login"><div class="logo">&#8377;</div><h1>Budget Desk</h1><p>Enter your password to continue.</p>
+<input type="password" name="password" placeholder="Password" autocomplete="current-password" autofocus required>
+{error}<button>Unlock</button></form></body></html>"""
+
+
+def _session_token():
+    return hmac.new(APP_PASSWORD.encode(), b"budget-desk-session", hashlib.sha256).hexdigest()
+
+
+def _authed(request: Request):
+    """Valid session cookie (browser) or HTTP Basic password (curl/scripts)."""
+    cookie = request.cookies.get("bd_session", "")
+    if cookie and secrets.compare_digest(cookie, _session_token()):
+        return True
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("basic "):
+        try:
+            pw = base64.b64decode(auth[6:]).decode().partition(":")[2]
+            return secrets.compare_digest(pw.encode(), APP_PASSWORD.encode())
+        except ValueError:
+            pass
+    return False
+
+
 @app.middleware("http")
 async def require_password(request: Request, call_next):
-    """Optional HTTP Basic gate (any username, password = APP_PASSWORD). Off when APP_PASSWORD is unset (local use)."""
-    if APP_PASSWORD:
-        ok = False
-        auth = request.headers.get("authorization", "")
-        if auth.lower().startswith("basic "):
-            try:
-                pw = base64.b64decode(auth[6:]).decode().partition(":")[2]
-                ok = secrets.compare_digest(pw.encode(), APP_PASSWORD.encode())
-            except ValueError:
-                pass
-        if not ok:
-            await asyncio.sleep(0.5)  # slows password guessing
-            return Response("Password required", 401, headers={"WWW-Authenticate": 'Basic realm="Budget Desk"'})
-    return await call_next(request)
+    """Off when APP_PASSWORD is unset (local use). Otherwise pages redirect to /login; the API answers 401."""
+    if not APP_PASSWORD or request.url.path in ("/login", "/logout") or _authed(request):
+        return await call_next(request)
+    if request.url.path.startswith("/api/"):
+        return Response("Password required", 401)
+    return RedirectResponse("/login", 303)
+
+
+@app.get("/login")
+def login_page():
+    return HTMLResponse(LOGIN_HTML.replace("{error}", "")) if APP_PASSWORD else RedirectResponse("/", 303)
+
+
+@app.post("/login")
+async def login(request: Request):
+    if not APP_PASSWORD:
+        return RedirectResponse("/", 303)
+    pw = parse_qs((await request.body()).decode()).get("password", [""])[0]
+    if secrets.compare_digest(pw.encode(), APP_PASSWORD.encode()):
+        r = RedirectResponse("/", 303)
+        r.set_cookie("bd_session", _session_token(), max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax",
+                     secure=request.headers.get("x-forwarded-proto") == "https")
+        return r
+    await asyncio.sleep(0.5)  # slows password guessing
+    return HTMLResponse(LOGIN_HTML.replace("{error}", '<p class="err">Wrong password</p>'), 401)
+
+
+@app.get("/logout")
+def logout():
+    r = RedirectResponse("/login", 303)
+    r.delete_cookie("bd_session")
+    return r
 
 
 @app.get("/")

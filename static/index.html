@@ -384,7 +384,7 @@ body.pre #thisMonth,body.pre #plan,body.pre #debts,body.pre #report,body.pre #fo
     <div id="affOut"></div>
   </section>
 
-  <p class="foot">Budget Desk is a planning aid, not a licensed financial advisor.</p>
+  <p class="foot">Budget Desk is a planning aid, not a licensed financial advisor. · <a href="/logout" style="color:inherit">Log out</a></p>
 </main>
 
 <aside class="card chat" id="chat" aria-label="Budget assistant">
@@ -402,6 +402,7 @@ body.pre #thisMonth,body.pre #plan,body.pre #debts,body.pre #report,body.pre #fo
 
 <script>
 /* ---------- helpers ---------- */
+const _fetch=fetch;window.fetch=async(...a)=>{const r=await _fetch(...a);if(r.status===401)location.href='/login';return r};  // session expired -> login page
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const num=v=>Number.isFinite(+v)?+v:0;
