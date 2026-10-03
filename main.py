@@ -804,16 +804,19 @@ FAILS: dict[str, list[float]] = {}  # client ip -> recent failed-login times. po
 CHAT_USED: dict[tuple[int, str], int] = {}  # (user id, date) -> assistant messages today
 
 
+PROXY_HOPS = int(os.getenv("PROXY_HOPS", "2"))  # proxies in front of the app that append to X-Forwarded-For: Cloudflare + Render
+
+
 def _ip(request: Request):
-    """The client's address behind Render. Cloudflare sets CF-Connecting-IP itself, so a client cannot forge it. Otherwise use
-    X-Forwarded-For: Cloudflare appends the client, then Render's proxy appends its own address, so the client is the entry
-    before the last; everything further left is client-supplied. Running locally there is no proxy: use the connection address."""
+    """The client's address behind Render. Cloudflare sets CF-Connecting-IP itself, so a client cannot forge it. If it is ever
+    missing, count PROXY_HOPS entries in from the right of X-Forwarded-For: Render's chain is `client, Cloudflare, Render proxy`,
+    and everything further left is client-supplied. With no proxy chain (local use) take the first entry or the connection address."""
     cf = request.headers.get("cf-connecting-ip", "").strip()
     if cf:
         return cf
     parts = [p.strip() for p in request.headers.get("x-forwarded-for", "").split(",") if p.strip()]
-    if len(parts) >= 2:
-        return parts[-2]
+    if len(parts) > PROXY_HOPS:
+        return parts[-(PROXY_HOPS + 1)]
     return parts[0] if parts else (request.client.host if request.client else "")
 
 
